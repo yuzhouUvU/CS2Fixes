@@ -31,14 +31,13 @@
 #include "playermanager.h"
 #include "adminsystem.h"
 #include "ctimer.h"
+#include "httpmanager.h"
 
 #include "tier0/memdbgon.h"
 
-
 extern CEntitySystem *g_pEntitySystem;
 extern IVEngineServer2* g_pEngineServer2;
-extern int g_targetPawn;
-extern int g_targetController;
+extern ISteamHTTP* g_http;
 
 WeaponMapEntry_t WeaponMap[] = {
 	{"bizon",		  "weapon_bizon",			 1400, 26},
@@ -153,12 +152,30 @@ void ParseChatCommand(const char *pMessage, CCSPlayerController *pController)
 
 	if (g_CommandList.IsValidIndex(index))
 	{
-		g_CommandList[index](args, pController);
+		(*g_CommandList[index])(args, pController);
 	}
 	else
 	{
 		ParseWeaponCommand(pController, args[0]);
 	}
+}
+
+bool CChatCommand::CheckCommandAccess(CBasePlayerController *pPlayer, uint64 flags)
+{
+	if (!pPlayer)
+		return false;
+
+	int slot = pPlayer->GetPlayerSlot();
+
+	ZEPlayer *pZEPlayer = g_playerManager->GetPlayer(slot);
+
+	if (!pZEPlayer->IsAdminFlagSet(flags))
+	{
+		ClientPrint(pPlayer, HUD_PRINTTALK, CHAT_PREFIX "You don't have access to this command.");
+		return false;
+	}
+
+	return true;
 }
 
 void ClientPrintAll(int hud_dest, const char *msg, ...)
@@ -243,14 +260,23 @@ CON_COMMAND_CHAT(ztele, "teleport to spawn")
 	//Count spawnpoints (info_player_counterterrorist & info_player_terrorist)
 	SpawnPoint* spawn = nullptr;
 	CUtlVector<SpawnPoint*> spawns;
-	while (nullptr != (spawn = (SpawnPoint*)UTIL_FindEntityByClassname(spawn, "info_player_")))
+	while (nullptr != (spawn = (SpawnPoint*)UTIL_FindEntityByClassname(spawn, "info_player_*")))
 	{
 		if (spawn->m_bEnabled())
 			spawns.AddToTail(spawn);
 	}
 
+	// Let's be real here, this should NEVER happen
+	// But I ran into this when I switched to the real FindEntityByClassname and forgot to insert a *
+	if (spawns.Count() == 0)
+	{
+		ClientPrint(player, HUD_PRINTTALK, CHAT_PREFIX"There are no spawns!");
+		Panic("ztele used while there are no spawns!\n");
+		return;
+	}
+
 	//Pick and get position of random spawnpoint
-	int randomindex = rand() % spawns.Count()+1;
+	int randomindex = rand() % spawns.Count();
 	Vector spawnpos = spawns[randomindex]->GetAbsOrigin();
 
 	//Here's where the mess starts
@@ -272,12 +298,12 @@ CON_COMMAND_CHAT(ztele, "teleport to spawn")
 
 	CHandle<CBasePlayerPawn> handle = pPawn->GetHandle();
 
-	new CTimer(5.0f, false, false, [spawnpos, handle, initialpos]()
+	new CTimer(5.0f, false, [spawnpos, handle, initialpos]()
 	{
 		CBasePlayerPawn *pPawn = handle.Get();
 
 		if (!pPawn)
-			return;
+			return -1.0f;
 
 		Vector endpos = pPawn->GetAbsOrigin();
 
@@ -289,8 +315,10 @@ CON_COMMAND_CHAT(ztele, "teleport to spawn")
 		else
 		{
 			ClientPrint(pPawn->GetController(), HUD_PRINTTALK, CHAT_PREFIX "Teleport failed! You moved too far.");
-			return;
+			return -1.0f;
 		}
+		
+		return -1.0f;
 	});
 }
 
@@ -330,6 +358,10 @@ CON_COMMAND_CHAT(hide, "hides nearby teammates")
 		return;
 	}
 
+	// allows for toggling hide with a bind by turning off when hide distance matches.
+	if (pZEPlayer->GetHideDistance() == distance)
+		distance = 0;
+
 	pZEPlayer->SetHideDistance(distance);
 
 	if (distance == 0)
@@ -348,16 +380,16 @@ CON_COMMAND_CHAT(message, "message someone")
 	// Note that the engine will treat this as a player slot number, not an entity index
 	int uid = atoi(args[1]);
 
-	CBasePlayerController *target = (CBasePlayerController *)g_pEntitySystem->GetBaseEntity((CEntityIndex)(uid + 1));
+	CCSPlayerController* pTarget = CCSPlayerController::FromSlot(uid);
 
-	if (!target)
+	if (!pTarget)
 		return;
 
 	// skipping the id and space, it's dumb but w/e
 	const char *pMessage = args.ArgS() + V_strlen(args[1]) + 1;
 
 	char buf[256];
-	V_snprintf(buf, sizeof(buf), CHAT_PREFIX"Private message from %s to %s: \5%s", player->GetPlayerName(), target->GetPlayerName(), pMessage);
+	V_snprintf(buf, sizeof(buf), CHAT_PREFIX"Private message from %s to %s: \5%s", player->GetPlayerName(), pTarget->GetPlayerName(), pMessage);
 
 	CSingleRecipientFilter filter(uid);
 
@@ -407,7 +439,7 @@ CON_COMMAND_CHAT(test_target, "test string targetting")
 
 	for (int i = 0; i < iNumClients; i++)
 	{
-		CBasePlayerController* pTarget = (CBasePlayerController*)g_pEntitySystem->GetBaseEntity((CEntityIndex)(pSlots[i] + 1));
+		CCSPlayerController* pTarget = CCSPlayerController::FromSlot(pSlots[i]);
 
 		if (!pTarget)
 			continue;
@@ -480,7 +512,7 @@ CON_COMMAND_CHAT(setcollisiongroup, "set a player's collision group")
 
 	for (int i = 0; i < iNumClients; i++)
 	{
-		CBasePlayerController *pTarget = (CBasePlayerController *)g_pEntitySystem->GetBaseEntity((CEntityIndex)(pSlots[i] + 1));
+		CCSPlayerController* pTarget = CCSPlayerController::FromSlot(pSlots[i]);
 
 		if (!pTarget)
 			continue;
@@ -505,7 +537,7 @@ CON_COMMAND_CHAT(setsolidtype, "set a player's solid type")
 
 	for (int i = 0; i < iNumClients; i++)
 	{
-		CBasePlayerController *pTarget = (CBasePlayerController *)g_pEntitySystem->GetBaseEntity((CEntityIndex)(pSlots[i] + 1));
+		CCSPlayerController* pTarget = CCSPlayerController::FromSlot(pSlots[i]);
 
 		if (!pTarget)
 			continue;
@@ -529,7 +561,7 @@ CON_COMMAND_CHAT(setinteraction, "set a player's interaction flags")
 
 	for (int i = 0; i < iNumClients; i++)
 	{
-		CBasePlayerController *pTarget = (CBasePlayerController *)g_pEntitySystem->GetBaseEntity((CEntityIndex)(pSlots[i] + 1));
+		CCSPlayerController* pTarget = CCSPlayerController::FromSlot(pSlots[i]);
 
 		if (!pTarget)
 			continue;
@@ -543,6 +575,38 @@ CON_COMMAND_CHAT(setinteraction, "set a player's interaction flags")
 
 		ClientPrint(player, HUD_PRINTTALK, CHAT_PREFIX "Setting interaction flags on %s from %llx to %llx.", pTarget->GetPlayerName(), oldInteractAs, newInteract);
 	}
+}
+
+void HttpCallback(HTTPRequestHandle request, char* response)
+{
+	ClientPrintAll(HUD_PRINTTALK, response);
+}
+
+CON_COMMAND_CHAT(http, "test an HTTP request")
+{
+	if (!g_http)
+	{
+		if (player)
+			ClientPrint(player, HUD_PRINTTALK, CHAT_PREFIX "Steam HTTP interface is not available!");
+		else
+			Message(CHAT_PREFIX "Steam HTTP interface is not available!\n");
+
+		return;
+	}
+	if (args.ArgC() < 3)
+	{
+		if (player)
+			ClientPrint(player, HUD_PRINTTALK, CHAT_PREFIX "Usage: !http <get/post> <url> [content]");
+		else
+			Message(CHAT_PREFIX "Usage: !http <get/post> <url> [content]\n");
+
+		return;
+	}
+
+	if (strcmp(args[1], "get") == 0)
+		g_HTTPManager.GET(args[2], &HttpCallback);
+	else if (strcmp(args[1], "post") == 0)
+		g_HTTPManager.POST(args[2], args[3], &HttpCallback);
 }
 #endif // _DEBUG
 

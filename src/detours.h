@@ -31,6 +31,8 @@ class CEntityIndex;
 class CCommand;
 class CTriggerPush;
 class CGameConfig;
+class CGameRules;
+class CTakeDamageInfo;
 
 bool InitDetours(CGameConfig *gameConfig);
 void FlushAllDetours();
@@ -43,6 +45,8 @@ void FASTCALL Detour_CSoundEmitterSystem_EmitSound(ISoundEmitterSystemBase *, CE
 //void FASTCALL Detour_CBaseEntity_Spawn(CBaseEntity *, void *);
 void FASTCALL Detour_CCSWeaponBase_Spawn(CBaseEntity *, void *);
 void FASTCALL Detour_TriggerPush_Touch(CTriggerPush* pPush, Z_CBaseEntity* pOther);
+void FASTCALL Detour_CGameRules_Constructor(CGameRules *pThis);
+void FASTCALL Detour_CBaseEntity_TakeDamageOld(Z_CBaseEntity *pThis, CTakeDamageInfo *inputInfo);
 
 extern CDetour<decltype(Detour_Host_Say)> Host_Say;
 extern CDetour<decltype(Detour_UTIL_SayTextFilter)> UTIL_SayTextFilter;

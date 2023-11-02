@@ -33,7 +33,19 @@ public:
 	SCHEMA_FIELD(CCSPlayer_ItemServices*, m_pItemServices)
 	SCHEMA_FIELD(CHandle<CBasePlayerController>, m_hController)
 
-	void CommitSuicide(bool bExplode, bool bForce) { CALL_VIRTUAL(void, 354, this, bExplode, bForce); }
+	void TakeDamage(int iDamage)
+	{
+		if (m_iHealth() - iDamage <= 0)
+			CommitSuicide(false, true);
+		else
+			Z_CBaseEntity::TakeDamage(iDamage);
+	}
+
+	void CommitSuicide(bool bExplode, bool bForce)
+	{
+		static int offset = g_GameConfig->GetOffset("CBasePlayerPawn_CommitSuicide");
+		CALL_VIRTUAL(void, offset, this, bExplode, bForce);
+	}
 
 	CBasePlayerController *GetController() { return m_hController.Get(); }
 };

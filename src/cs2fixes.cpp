@@ -42,12 +42,17 @@
 #include "playermanager.h"
 #include <entity.h>
 #include "adminsystem.h"
+#include "commands.h"
 #include "eventlistener.h"
 #include "gameconfig.h"
+#include "votemanager.h"
+#include "httpmanager.h"
+#include "entity/cgamerules.h"
+
+#define VPROF_ENABLED
+#include "tier0/vprof.h"
 
 #include "tier0/memdbgon.h"
-
-CEntitySystem* g_pEntitySystem = nullptr;
 
 float g_flUniversalTime;
 float g_flLastTickedTime;
@@ -87,6 +92,8 @@ void Panic(const char *msg, ...)
 class GameSessionConfiguration_t { };
 
 SH_DECL_HOOK3_void(IServerGameDLL, GameFrame, SH_NOATTRIB, 0, bool, bool, bool);
+SH_DECL_HOOK0_void(IServerGameDLL, GameServerSteamAPIActivated, SH_NOATTRIB, 0);
+SH_DECL_HOOK0_void(IServerGameDLL, GameServerSteamAPIDeactivated, SH_NOATTRIB, 0);
 SH_DECL_HOOK4_void(IServerGameClients, ClientActive, SH_NOATTRIB, 0, CPlayerSlot, bool, const char *, uint64);
 SH_DECL_HOOK5_void(IServerGameClients, ClientDisconnect, SH_NOATTRIB, 0, CPlayerSlot, int, const char *, uint64, const char *);
 SH_DECL_HOOK4_void(IServerGameClients, ClientPutInServer, SH_NOATTRIB, 0, CPlayerSlot, char const *, int, uint64);
@@ -100,18 +107,6 @@ SH_DECL_HOOK6_void(ISource2GameEntities, CheckTransmit, SH_NOATTRIB, 0, CCheckTr
 SH_DECL_HOOK2_void(IServerGameClients, ClientCommand, SH_NOATTRIB, 0, CPlayerSlot, const CCommand &);
 
 CS2Fixes g_CS2Fixes;
-
-// Should only be called within the active game loop (i e map should be loaded and active)
-// otherwise that'll be nullptr!
-CGlobalVars *GetGameGlobals()
-{
-	INetworkGameServer *server = g_pNetworkServerService->GetIGameServer();
-
-	if (!server)
-		return nullptr;
-
-	return server->GetGlobals();
-}
 
 #if 0
 // Currently unavailable, requires hl2sdk work!
@@ -128,13 +123,17 @@ CON_COMMAND_F(toggle_logs, "Toggle printing most logs and warnings", FCVAR_SPONL
 	ToggleLogs();
 }
 
-IGameEventSystem* g_gameEventSystem;
-IGameEventManager2* g_gameEventManager = nullptr;
-INetworkGameServer* g_networkGameServer;
-CGlobalVars* gpGlobals = nullptr;
-CPlayerManager* g_playerManager = nullptr;
-IVEngineServer2* g_pEngineServer2;
+IGameEventSystem *g_gameEventSystem = nullptr;
+IGameEventManager2 *g_gameEventManager = nullptr;
+INetworkGameServer *g_pNetworkGameServer = nullptr;
+CEntitySystem *g_pEntitySystem = nullptr;
+CGlobalVars *gpGlobals = nullptr;
+CPlayerManager *g_playerManager = nullptr;
+IVEngineServer2 *g_pEngineServer2 = nullptr;
 CGameConfig *g_GameConfig = nullptr;
+ISteamHTTP *g_http = nullptr;
+CSteamGameServerAPIContext g_steamAPI;
+CCSGameRules *g_pGameRules = nullptr;
 
 PLUGIN_EXPOSE(CS2Fixes, g_CS2Fixes);
 bool CS2Fixes::Load(PluginId id, ISmmAPI *ismm, char *error, size_t maxlen, bool late)
@@ -144,19 +143,18 @@ bool CS2Fixes::Load(PluginId id, ISmmAPI *ismm, char *error, size_t maxlen, bool
 	GET_V_IFACE_CURRENT(GetEngineFactory, g_pEngineServer2, IVEngineServer2, SOURCE2ENGINETOSERVER_INTERFACE_VERSION);
 	GET_V_IFACE_CURRENT(GetEngineFactory, g_pCVar, ICvar, CVAR_INTERFACE_VERSION);
 	GET_V_IFACE_ANY(GetServerFactory, g_pSource2Server, ISource2Server, SOURCE2SERVER_INTERFACE_VERSION);
+	GET_V_IFACE_ANY(GetServerFactory, g_pSource2ServerConfig, ISource2ServerConfig, SOURCE2SERVERCONFIG_INTERFACE_VERSION);
 	GET_V_IFACE_ANY(GetServerFactory, g_pSource2GameEntities, ISource2GameEntities, SOURCE2GAMEENTITIES_INTERFACE_VERSION);
 	GET_V_IFACE_ANY(GetServerFactory, g_pSource2GameClients, IServerGameClients, SOURCE2GAMECLIENTS_INTERFACE_VERSION);
 	GET_V_IFACE_ANY(GetEngineFactory, g_pNetworkServerService, INetworkServerService, NETWORKSERVERSERVICE_INTERFACE_VERSION);
 	GET_V_IFACE_ANY(GetEngineFactory, g_gameEventSystem, IGameEventSystem, GAMEEVENTSYSTEM_INTERFACE_VERSION);
 	GET_V_IFACE_ANY(GetFileSystemFactory, g_pFullFileSystem, IFileSystem, FILESYSTEM_INTERFACE_VERSION);
 
-	// Currently doesn't work from within mm side, use GetGameGlobals() in the mean time instead
-	// this needs to run in case of a late load
-	gpGlobals = GetGameGlobals();
-
 	Message( "Starting plugin.\n" );
 
 	SH_ADD_HOOK_MEMFUNC(IServerGameDLL, GameFrame, g_pSource2Server, this, &CS2Fixes::Hook_GameFrame, true);
+	SH_ADD_HOOK_MEMFUNC(IServerGameDLL, GameServerSteamAPIActivated, g_pSource2Server, this, &CS2Fixes::Hook_GameServerSteamAPIActivated, false);
+	SH_ADD_HOOK_MEMFUNC(IServerGameDLL, GameServerSteamAPIDeactivated, g_pSource2Server, this, &CS2Fixes::Hook_GameServerSteamAPIDeactivated, false);
 	SH_ADD_HOOK_MEMFUNC(IServerGameClients, ClientActive, g_pSource2GameClients, this, &CS2Fixes::Hook_ClientActive, true);
 	SH_ADD_HOOK_MEMFUNC(IServerGameClients, ClientDisconnect, g_pSource2GameClients, this, &CS2Fixes::Hook_ClientDisconnect, true);
 	SH_ADD_HOOK_MEMFUNC(IServerGameClients, ClientPutInServer, g_pSource2GameClients, this, &CS2Fixes::Hook_ClientPutInServer, true);
@@ -220,29 +218,34 @@ bool CS2Fixes::Load(PluginId id, ISmmAPI *ismm, char *error, size_t maxlen, bool
 	{
 		RegisterEventListeners();
 		g_pEntitySystem = interfaces::pGameResourceServiceServer->GetGameEntitySystem();
+		g_pNetworkGameServer = g_pNetworkServerService->GetIGameServer();
+		gpGlobals = g_pNetworkGameServer->GetGlobals();
 	}
 
 	ConVar_Register(FCVAR_RELEASE | FCVAR_CLIENT_CAN_EXECUTE | FCVAR_GAMEDLL);
 
-	g_playerManager = new CPlayerManager(late);
 	g_pAdminSystem = new CAdminSystem();
+	g_playerManager = new CPlayerManager(late);
 
 	// Steam authentication
-	new CTimer(1.0f, true, true, []()
+	new CTimer(1.0f, true, []()
 	{
 		g_playerManager->TryAuthenticate();
+		return 1.0f;
 	});
 
 	// Check hide distance
-	new CTimer(0.5f, true, true, []()
+	new CTimer(0.5f, true, []()
 	{
 		g_playerManager->CheckHideDistances();
+		return 0.5f;
 	});
 
 	// Check for the expiration of infractions like mutes or gags
-	new CTimer(30.0f, true, true, []()
+	new CTimer(30.0f, true, []()
 	{
 		g_playerManager->CheckInfractions();
+		return 30.0f;
 	});
 
 	srand(time(0));
@@ -273,13 +276,13 @@ bool CS2Fixes::Unload(char *error, size_t maxlen)
 	RemoveTimers();
 	UnregisterEventListeners();
 
-	if (g_playerManager != NULL)
+	if (g_playerManager)
 		delete g_playerManager;
 
-	if (g_pAdminSystem != NULL)
+	if (g_pAdminSystem)
 		delete g_pAdminSystem;
 
-	if (g_GameConfig != NULL)
+	if (g_GameConfig)
 		delete g_GameConfig;
 
 	return true;
@@ -287,24 +290,57 @@ bool CS2Fixes::Unload(char *error, size_t maxlen)
 
 void CS2Fixes::Hook_StartupServer(const GameSessionConfiguration_t& config, ISource2WorldSession*, const char*)
 {
-	Message("startup server\n");
+	g_pNetworkGameServer = g_pNetworkServerService->GetIGameServer();
+	g_pEntitySystem = interfaces::pGameResourceServiceServer->GetGameEntitySystem();
+	gpGlobals = g_pNetworkGameServer->GetGlobals();
+
+	// exec a map cfg
+	Message("Hook_StartupServer: Running map config for %s\n", gpGlobals->mapname);
+
+	char cmd[MAX_PATH];
+	V_snprintf(cmd, sizeof(cmd), "exec maps/%s", gpGlobals->mapname);
+	g_pEngineServer2->ServerCommand(cmd);
 
 	if(g_bHasTicked)
 		RemoveMapTimers();
 
 	g_bHasTicked = false;
-	gpGlobals = GetGameGlobals();
-
-	if (gpGlobals == nullptr)
-	{
-		Error("Failed to lookup gpGlobals\n");
-	}
 
 	RegisterEventListeners();
 
-	g_pEntitySystem = interfaces::pGameResourceServiceServer->GetGameEntitySystem();
+	// Disable RTV and Extend votes after map has just started
+	g_RTVState = ERTVState::MAP_START;
+	g_ExtendState = EExtendState::MAP_START;
+
+	// Allow RTV and Extend votes after 2 minutes post map start
+	new CTimer(120.0f, false, []()
+	{
+		if (g_RTVState != ERTVState::BLOCKED_BY_ADMIN)
+			g_RTVState = ERTVState::RTV_ALLOWED;
+
+		if (g_ExtendState != EExtendState::NO_EXTENDS)
+			g_ExtendState = EExtendState::EXTEND_ALLOWED;
+		return -1.0f;
+	});
+
+	// Set amount of Extends left
+	g_ExtendsLeft = 1;
 }
 
+void CS2Fixes::Hook_GameServerSteamAPIActivated()
+{
+	g_steamAPI.Init();
+	g_http = g_steamAPI.SteamHTTP();
+
+	RETURN_META(MRES_IGNORED);
+}
+
+void CS2Fixes::Hook_GameServerSteamAPIDeactivated()
+{
+	g_http = nullptr;
+
+	RETURN_META(MRES_IGNORED);
+}
 
 void CS2Fixes::Hook_PostEvent(CSplitScreenSlot nSlot, bool bLocalOnly, int nClientCount, const uint64* clients,
 	INetworkSerializable* pEvent, const void* pData, unsigned long nSize, NetChannelBufType_t bufType)
@@ -414,6 +450,7 @@ void CS2Fixes::Hook_ClientDisconnect( CPlayerSlot slot, int reason, const char *
 
 void CS2Fixes::Hook_GameFrame( bool simulating, bool bFirstTick, bool bLastTick )
 {
+	VPROF_ENTER_SCOPE(__FUNCTION__);
 	/**
 	 * simulating:
 	 * ***********
@@ -444,19 +481,21 @@ void CS2Fixes::Hook_GameFrame( bool simulating, bool bFirstTick, bool bLastTick 
 			timer->m_flLastExecute = g_flUniversalTime;
 
 		// Timer execute 
-		if (timer->m_flLastExecute + timer->m_flTime <= g_flUniversalTime)
+		if (timer->m_flLastExecute + timer->m_flInterval <= g_flUniversalTime)
 		{
-			timer->Execute();
-
-			if (!timer->m_bRepeat)
+			if (!timer->Execute())
 			{
 				delete timer;
 				g_timers.Remove(prevIndex);
 			}
 			else
+			{
 				timer->m_flLastExecute = g_flUniversalTime;
+			}
 		}
 	}
+
+	VPROF_EXIT_SCOPE();
 }
 
 void CS2Fixes::Hook_CheckTransmit(CCheckTransmitInfo **ppInfoList, int infoCount, CBitVec<16384> &unionTransmitEdicts,
@@ -464,6 +503,8 @@ void CS2Fixes::Hook_CheckTransmit(CCheckTransmitInfo **ppInfoList, int infoCount
 {
 	if (!g_pEntitySystem)
 		return;
+
+	VPROF_ENTER_SCOPE(__FUNCTION__);
 
 	for (int i = 0; i < infoCount; i++)
 	{
@@ -473,7 +514,7 @@ void CS2Fixes::Hook_CheckTransmit(CCheckTransmitInfo **ppInfoList, int infoCount
 		// though this is probably part of the client class that contains the CCheckTransmitInfo
 		int iPlayerSlot = (int)*((uint8 *)pInfo + 560);
 
-		auto pSelfController = (CCSPlayerController *)g_pEntitySystem->GetBaseEntity((CEntityIndex)(iPlayerSlot + 1));
+		CCSPlayerController* pSelfController = CCSPlayerController::FromSlot(iPlayerSlot);
 
 		if (!pSelfController || !pSelfController->IsConnected() || !pSelfController->m_bPawnIsAlive)
 			continue;
@@ -488,12 +529,12 @@ void CS2Fixes::Hook_CheckTransmit(CCheckTransmitInfo **ppInfoList, int infoCount
 		if (!pSelfZEPlayer)
 			continue;
 
-		for (int i = 1; i <= g_playerManager->GetMaxPlayers(); i++)
+		for (int i = 0; i < gpGlobals->maxClients; i++)
 		{
-			if (!pSelfZEPlayer->ShouldBlockTransmit(i - 1))
+			if (!pSelfZEPlayer->ShouldBlockTransmit(i))
 				continue;
 
-			auto pController = (CBasePlayerController *)g_pEntitySystem->GetBaseEntity((CEntityIndex)i);
+			CCSPlayerController* pController = CCSPlayerController::FromSlot(i);
 
 			if (!pController)
 				continue;
@@ -506,6 +547,8 @@ void CS2Fixes::Hook_CheckTransmit(CCheckTransmitInfo **ppInfoList, int infoCount
 			pInfo->m_pTransmitEntity->Clear(pPawn->entindex());
 		}
 	}
+
+	VPROF_EXIT_SCOPE();
 }
 
 // Potentially might not work

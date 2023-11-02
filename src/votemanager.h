@@ -1,3 +1,4 @@
+
 /**
  * =============================================================================
  * CS2Fixes
@@ -19,25 +20,27 @@
 
 #pragma once
 
-#include "cbaseentity.h"
-
-struct VPhysicsCollisionAttribute_t
+enum class ERTVState
 {
-	DECLARE_SCHEMA_CLASS_INLINE(VPhysicsCollisionAttribute_t)
-
-	SCHEMA_FIELD(uint8, m_nCollisionGroup)
-	SCHEMA_FIELD(uint64_t, m_nInteractsAs)
-	SCHEMA_FIELD(uint64_t, m_nInteractsWith)
-	SCHEMA_FIELD(uint64_t, m_nInteractsExclude)
+	MAP_START,
+	RTV_ALLOWED,
+	POST_RTV_SUCCESSFULL,
+	POST_LAST_ROUND_END,
+	BLOCKED_BY_ADMIN,
 };
 
-class CCollisionProperty
+enum class EExtendState
 {
-public:
-	DECLARE_SCHEMA_CLASS_INLINE(CCollisionProperty)
-
-	SCHEMA_FIELD(VPhysicsCollisionAttribute_t, m_collisionAttribute)
-	SCHEMA_FIELD(SolidType_t, m_nSolidType)
-	SCHEMA_FIELD(uint8, m_usSolidFlags)
-	SCHEMA_FIELD(uint8, m_CollisionGroup)
+	MAP_START,
+	EXTEND_ALLOWED,
+	POST_EXTEND_COOLDOWN,
+	POST_EXTEND_NO_EXTENDS_LEFT,
+	POST_LAST_ROUND_END,
+	NO_EXTENDS,
 };
+
+extern ERTVState g_RTVState;
+extern EExtendState g_ExtendState;
+extern int g_ExtendsLeft;
+
+void SetExtendsLeft();
