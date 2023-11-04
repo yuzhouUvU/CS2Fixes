@@ -91,6 +91,7 @@ jobs:
         with:
           repo_token: ${{ secrets.TOKEN }}
           file: '*.zip'
+          
           tag: ${{ github.ref }}
           file_glob: true
           
